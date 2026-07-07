@@ -1,0 +1,23 @@
+# Playwright session directory (contains active login cookies - DO NOT COMMIT!)
+.playwright_session/
+
+# Download folder
+downloads/
+
+# User exported bookmark lists (contains private links)
+x_bookmarks_*.txt
+x_bookmarks_data_*.json
+*.txt
+*.json
+# Except package.json or metadata files if they existed
+!package.json
+
+# Python caching
+__pycache__/
+*.pyc
+
+# Local environment / IDE
+.vscode/
+.idea/
+venv/
+.venv/
