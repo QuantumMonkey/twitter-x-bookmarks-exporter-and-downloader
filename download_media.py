@@ -31,90 +31,164 @@ def extract_tweet_id(url):
     return match.group(1) if match else None
 
 def download_file(url, filepath):
-    """Downloads a file (image/video) from a URL and saves it to filepath."""
+    """Downloads a file (image/video) from a URL with chunked reading and automatic range resume on interruption."""
     headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Referer': 'https://twmate.com/'
     }
-    req = urllib.request.Request(url, headers=headers)
-    try:
-        with urllib.request.urlopen(req, timeout=30) as response, open(filepath, 'wb') as out_file:
-            out_file.write(response.read())
-        return True
-    except Exception as e:
-        print(f"    [-] Download failed: {e}")
-        return False
+    
+    max_retries = 5
+    retry_delay = 5
+    
+    for attempt in range(max_retries):
+        mode = 'wb'
+        existing_bytes = 0
+        
+        # Check if file already exists (partial download from previous attempt in this call)
+        if os.path.exists(filepath):
+            existing_bytes = os.path.getsize(filepath)
+            if existing_bytes > 0:
+                mode = 'ab'
+                
+        req_headers = headers.copy()
+        if existing_bytes > 0:
+            req_headers['Range'] = f'bytes={existing_bytes}-'
+            
+        req = urllib.request.Request(url, headers=req_headers)
+        try:
+            with urllib.request.urlopen(req, timeout=30) as response:
+                status = response.status if hasattr(response, 'status') else response.getcode()
+                
+                # If range request was ignored, download from scratch
+                if existing_bytes > 0 and status != 206:
+                    mode = 'wb'
+                    existing_bytes = 0
+                    
+                with open(filepath, mode) as out_file:
+                    while True:
+                        chunk = response.read(1024 * 1024)  # 1 MB chunk size
+                        if not chunk:
+                            break
+                        out_file.write(chunk)
+                        
+            # Verify download success and non-zero size
+            if os.path.exists(filepath) and os.path.getsize(filepath) > 0:
+                return True
+            else:
+                try:
+                    if os.path.exists(filepath):
+                        os.remove(filepath)
+                except Exception:
+                    pass
+                return False
+                
+        except Exception as e:
+            print(f"    [-] Chunk download attempt {attempt+1}/{max_retries} failed: {e}")
+            if attempt < max_retries - 1:
+                time.sleep(retry_delay)
+            else:
+                # Cleanup on final failure
+                try:
+                    if os.path.exists(filepath):
+                        os.remove(filepath)
+                except Exception:
+                    pass
+                return False
 
 def get_media_from_twmate(tweet_url):
     """Automates twmate.com headlessly to extract direct image and video URLs for a tweet. Bypasses X logins and India geoblocks."""
     with sync_playwright() as p:
+        search_completed = False
         try:
             browser = p.chromium.launch(headless=True)
             page = browser.new_page()
-            page.goto("https://twmate.com/", wait_until="domcontentloaded")
+            page.goto("https://twmate.com/")
+            page.wait_for_timeout(3000)
             
             # Dismiss cookie consent dialog if it appears
             try:
-                page.wait_for_selector("#disagree-btn", timeout=4000)
-                page.click("#disagree-btn")
+                page.click("#disagree-btn", timeout=2000)
             except Exception:
                 pass
                 
-            page.wait_for_selector('input[name="page"]', timeout=10000)
             page.fill('input[name="page"]', tweet_url)
-            page.click(".btn_submit")
+            page.press('input[name="page"]', 'Enter')
             
-            # Wait for either video or photo download links to appear
+            # Wait up to 30 seconds for download links to load or an error message to appear
             try:
-                page.wait_for_selector("a[href*='twimg']", timeout=12000)
+                page.wait_for_selector("a[href*='/download/'], text=invalid url, text=invalid tweet url", timeout=30000)
             except Exception:
                 pass
-                
+            
+            # Parse Images
             links = page.query_selector_all("a")
             image_urls = []
-            video_urls = []
-            
             for l in links:
                 href = l.get_attribute("href") or ""
-                if "pbs.twimg.com/media" in href:
-                    orig_src = re.sub(r'name=\w+', 'name=orig', href)
-                    if 'name=' not in orig_src:
-                        orig_src += '&name=orig' if '?' in orig_src else '?name=orig'
-                    if orig_src not in image_urls:
-                        image_urls.append(orig_src)
-                elif "video.twimg.com" in href:
-                    if href not in video_urls:
-                        video_urls.append(href)
-                        
-            # Group videos to find best resolutions
+                text = l.inner_text() or ""
+                if "download another" in text.lower():
+                    search_completed = True
+                if href.startswith("/"):
+                    href = "https://twmate.com" + href
+                if "/download/" in href:
+                    # Match links that have image resolutions or extensions
+                    if any(x in text.lower() for x in ["download", "150x150", "x"]) or any(x in href.lower() for x in [".jpg", ".jpeg", ".png"]):
+                        if href not in image_urls:
+                            image_urls.append(href)
+                            
+            # Parse Videos by Table resolution grouping
+            tables = page.query_selector_all("table")
             best_video_urls = []
-            if video_urls:
-                video_groups = {}
-                for v_url in video_urls:
-                    base_url = v_url.split('/vid/')[0] if '/vid/' in v_url else v_url
-                    if base_url not in video_groups:
-                        video_groups[base_url] = []
-                    video_groups[base_url].append(v_url)
-                
-                for base_url, urls in video_groups.items():
-                    best_url = None
-                    best_res = 0
-                    for url in urls:
-                        res_match = re.search(r'(\d+)x(\d+)', url)
-                        if res_match:
-                            res = int(res_match.group(1)) * int(res_match.group(2))
-                        else:
-                            res = 1
-                        if res > best_res:
-                            best_res = res
-                            best_url = url
-                    if not best_url and urls:
-                        best_url = urls[0]
-                    if best_url:
-                        best_video_urls.append(best_url)
-                        
-            return image_urls, best_video_urls
+            for t in tables:
+                rows = t.query_selector_all("tr")
+                best_url = None
+                best_height = 0
+                for r in rows:
+                    text = r.inner_text() or ""
+                    if "download" in text.lower() and ("mp4" in text.lower() or "video" in text.lower()):
+                        link_el = r.query_selector("a[href*='/download/']")
+                        if link_el:
+                            href = link_el.get_attribute("href")
+                            if href.startswith("/"):
+                                href = "https://twmate.com" + href
+                            
+                            # Parse height
+                            res_match = re.search(r'(\d+)x(\d+)', text)
+                            if res_match:
+                                height = int(res_match.group(2))
+                            else:
+                                p_match = re.search(r'(\d+)p', text)
+                                height = int(p_match.group(1)) if p_match else 1
+                                
+                            if height > best_height:
+                                best_height = height
+                                best_url = href
+                if best_url:
+                    best_video_urls.append(best_url)
+            
+            # Fallback if no table-based videos found: look for any direct /download/ links containing MP4/video keywords
+            if not best_video_urls:
+                for l in links:
+                    href = l.get_attribute("href") or ""
+                    text = l.inner_text() or ""
+                    if href.startswith("/"):
+                        href = "https://twmate.com" + href
+                    if "/download/" in href and ("mp4" in text.lower() or "video" in text.lower() or "mp4" in href.lower()):
+                        if href not in best_video_urls:
+                            best_video_urls.append(href)
+                    
+            # Double check search completion using text selector if "download another" link not found yet
+            if not search_completed:
+                content_lower = page.content().lower()
+                if "download another" in content_lower:
+                    search_completed = True
+                elif "invalid url" in content_lower or "invalid tweet url" in content_lower:
+                    print("    [-] twmate.com returned: Invalid url (tweet may be private, deleted, or has no media).")
+                    search_completed = True
+                    
+            return image_urls, best_video_urls, search_completed
         except Exception:
-            return [], []
+            return [], [], False
         finally:
             browser.close()
 
@@ -177,8 +251,15 @@ def process_via_json(json_path, downloads_dir):
         if has_video:
             print("    [+] Video/GIF detected. Resolving via twmate.com...")
             media_found = True
-            _, video_urls = get_media_from_twmate(url)
-            if video_urls:
+            _, video_urls, search_completed = get_media_from_twmate(url)
+            if not search_completed:
+                print("    [-] twmate.com request timed out or was rate-limited. Retrying in 15 seconds...")
+                time.sleep(15.0)
+                _, video_urls, search_completed = get_media_from_twmate(url)
+                if not search_completed:
+                    print("    [-] twmate.com retry failed. Keeping in queue to retry.")
+                    download_success = False
+            elif video_urls:
                 print(f"    [+] Found {len(video_urls)} video(s). Downloading...")
                 vid_idx = 1
                 for v_url in video_urls:
@@ -205,7 +286,7 @@ def process_via_json(json_path, downloads_dir):
                 json.dump(remaining_bookmarks, f, indent=2)
             success_count += 1
             
-        time.sleep(1.0)
+        time.sleep(5.0)
             
     print(f"\n[+] Processing finished! Successfully processed {success_count}/{total_bookmarks} bookmarks.")
 
@@ -242,8 +323,16 @@ def process_via_txt(txt_path, downloads_dir):
         print(f"[{idx}/{total_urls}] Resolving media for tweet {tweet_id}...")
         
         # Scrape twmate.com for BOTH images and videos
-        image_urls, video_urls = get_media_from_twmate(url)
+        image_urls, video_urls, search_completed = get_media_from_twmate(url)
         
+        if not search_completed:
+            print("    [-] twmate.com request timed out or was rate-limited. Retrying in 15 seconds...")
+            time.sleep(15.0)
+            image_urls, video_urls, search_completed = get_media_from_twmate(url)
+            if not search_completed:
+                print("    [-] twmate.com retry failed. Keeping in queue to retry.")
+                continue
+            
         download_success = True
         media_found = False
         
@@ -290,7 +379,7 @@ def process_via_txt(txt_path, downloads_dir):
         else:
             print("    [-] Extraction failed or incomplete. Keeping in queue to retry.")
             
-        time.sleep(1.0)
+        time.sleep(5.0)
         
     print(f"\n[+] Text Mode finished! Successfully processed {success_count}/{total_urls} bookmarks.")
 
