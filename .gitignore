@@ -21,3 +21,6 @@ __pycache__/
 .idea/
 venv/
 .venv/
+
+# Second download folder (55 GB of scraped media - never commit)
+downloads1/
